@@ -1,0 +1,154 @@
+<!doctype html>
+<html lang="de"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>TychoYard</title><link rel="manifest" href="app.webmanifest"><meta name="theme-color" content="#101923">
+<style>
+*{box-sizing:border-box}body{margin:0;background:#101923;color:#eff5f9;font:16px system-ui}main{max-width:860px;margin:auto;padding:32px 18px}h1{margin:0 0 6px;font-size:2.5rem}p{line-height:1.5}label{display:block;margin:12px 0 5px}button,input,textarea{font:inherit;color:inherit;background:#1d2b38;border:1px solid #546b7c;border-radius:8px;padding:9px 12px}button{cursor:pointer}button:disabled{opacity:.55;cursor:default}button.primary{background:#aaf0d6;color:#10271e;border-color:#aaf0d6}input,textarea{width:100%}textarea{min-height:340px;font:14px/1.6 ui-monospace,monospace}summary{cursor:pointer;font-weight:600}details,.entry{margin:8px 0}.children{margin-left:10px;padding-left:14px;border-left:1px solid #546b7c}.panel{background:#16222e;border:1px solid #384b5b;padding:16px;border-radius:12px;margin:16px 0}.bar{display:flex;flex-wrap:wrap;gap:8px;margin:12px 0}.muted{color:#b6c6d3}pre{white-space:pre-wrap;overflow-wrap:anywhere} [hidden]{display:none!important}
+</style>
+<main><h1>TychoYard</h1><p class="muted">Werkstattprojekte</p>
+<section class="panel"><label for="token">GitHub-Zugriffstoken</label><input id="token" type="password" autocomplete="off" spellcheck="false">
+<p class="muted">Fine-grained Token für MarQQin/tycho-yard-data mit Contents: Read and write. Das Token bleibt nur im Arbeitsspeicher dieser Seite.</p>
+<div class="bar"><button id="load">Von GitHub laden</button><button class="primary" id="save">Auf GitHub speichern</button><button id="download">Markdown herunterladen</button></div>
+<p id="status" role="status"></p></section>
+<div class="bar"><button id="showTree" aria-pressed="true">Projektbaum</button><button id="showEditor" aria-pressed="false">Texteditor</button></div>
+<section id="tree" class="panel"></section><textarea id="editor" aria-label="Projekte als Markdown" spellcheck="false" hidden placeholder="# Projekt&#10;## Aufgabe"></textarea>
+<section id="conflict" class="panel" hidden><h2>GitHub hat einen neueren Stand</h2><p>Dein Entwurf bleibt im Editor. Vergleiche ihn mit der GitHub-Fassung unten. Du kannst die GitHub-Fassung laden oder deinen Entwurf von Hand zusammenführen und danach speichern.</p><div class="bar"><button id="useRemote">GitHub-Fassung laden</button><button id="merged">Entwurf ist zusammengeführt</button></div><pre id="remoteText"></pre></section>
+</main>
+<script>
+const el = id => document.getElementById(id);
+const editor = el('editor'), status = el('status'), token = el('token');
+const endpoint = 'https://api.github.com/repos/MarQQin/tycho-yard-data/contents/projekte.md';
+const key = 'tycho-yard-local-v1';
+let base = null, remote = null, busy = false;
+try {
+  const local = JSON.parse(localStorage.getItem(key) || 'null');
+  if (local) { editor.value = local.draft; base = local.base; }
+} catch {}
+const dirty = () => editor.value !== (base?.text ?? '');
+function remember() {
+  try { localStorage.setItem(key, JSON.stringify({draft:editor.value,base})); return true; }
+  catch { return false; }
+}
+function report(message) { status.textContent = message; }
+function localStatus() {
+  const persisted = remember();
+  report(dirty() ? (persisted ? 'Entwurf nur auf diesem Gerät.' : 'Entwurf nur in diesem Fenster. Bitte herunterladen oder speichern.') : base ? 'Entspricht zuletzt bestätigtem GitHub-Stand.' : 'Noch kein GitHub-Stand geladen.');
+}
+function render() {
+  const root = [], stack = [];
+  for (const line of editor.value.split(/\r?\n/)) {
+    const match = /^(#{1,6})\s+(.+)$/.exec(line);
+    if (!match) continue;
+    const item = {level:match[1].length,title:match[2],children:[]};
+    while (stack.length && stack.at(-1).level >= item.level) stack.pop();
+    (stack.at(-1)?.children ?? root).push(item);
+    stack.push(item);
+  }
+  function draw(items, parent) {
+    for (const item of items) {
+      const node = document.createElement(item.children.length ? 'details' : 'div');
+      node.className = 'entry';
+      if (item.children.length) {
+        const label = document.createElement('summary');
+        label.textContent = item.title;
+        const children = document.createElement('div');
+        children.className = 'children';
+        draw(item.children,children);
+        node.append(label,children);
+      } else node.textContent = item.title;
+      parent.append(node);
+    }
+  }
+  const tree = el('tree');
+  tree.replaceChildren();
+  if (!root.length) tree.textContent = 'Lade deine Projekte von GitHub oder beginne im Texteditor.';
+  else draw(root,tree);
+}
+function show(edit) {
+  editor.hidden = !edit;
+  el('tree').hidden = edit;
+  el('showTree').setAttribute('aria-pressed', String(!edit));
+  el('showEditor').setAttribute('aria-pressed', String(edit));
+  if (!edit) render();
+}
+function showConflict(current) {
+  remote = current;
+  el('conflict').hidden = !current;
+  el('remoteText').textContent = current?.text ?? '';
+  el('save').disabled = busy || !!remote;
+  if (current) { show(true); report('Konflikt: Dein Entwurf wurde nicht überschrieben.'); }
+}
+async function request(method, body) {
+  const response = await fetch(endpoint, {
+    method, cache:'no-store',
+    headers:{Accept:'application/vnd.github+json',Authorization:'Bearer '+token.value.trim(),'Content-Type':'application/json'},
+    body:body ? JSON.stringify(body) : undefined
+  });
+  return response;
+}
+async function readRemote() {
+  const response = await request('GET');
+  if (!response.ok) throw new Error('Laden fehlgeschlagen (HTTP '+response.status+'). Token und Repo-Freigabe prüfen.');
+  const file = await response.json();
+  return {sha:file.sha,text:new TextDecoder().decode(Uint8Array.from(atob(file.content), c=>c.charCodeAt(0))).replace(/\r\n/g,'\n')};
+}
+async function run(action) {
+  if (busy) return;
+  if (!token.value.trim()) { report('Bitte GitHub-Token eingeben.'); token.focus(); return; }
+  busy = true;
+  editor.readOnly = true;
+  for (const id of ['load','save','useRemote','merged']) el(id).disabled = true;
+  report('GitHub wird kontaktiert …');
+  try { await action(); }
+  catch (error) { report(error.message); }
+  finally {
+    busy = false; editor.readOnly = false;
+    for (const id of ['load','useRemote','merged']) el(id).disabled = false;
+    el('save').disabled = !!remote;
+  }
+}
+function adopt(current) { base = current; editor.value = current.text; showConflict(null); render(); localStatus(); }
+el('load').onclick = () => run(async () => {
+  const current = await readRemote();
+  if (!dirty() || editor.value === current.text) adopt(current);
+  else if (base?.sha !== current.sha) showConflict(current);
+  else { showConflict(null); localStatus(); }
+});
+el('save').onclick = () => run(async () => {
+  if (!base) {
+    const current = await readRemote();
+    if (!dirty() || editor.value === current.text) adopt(current);
+    else showConflict(current);
+    return;
+  }
+  const draft = editor.value;
+  if (!dirty()) { report('Keine lokalen Änderungen zum Speichern.'); return; }
+  const content = btoa(Array.from(new TextEncoder().encode(draft), b=>String.fromCharCode(b)).join(''));
+  const response = await request('PUT',{message:'Update Projekte in TychoYard',content,sha:base.sha});
+  if (response.status === 409 || response.status === 422) {
+    const current = await readRemote();
+    if (current.text === draft) { adopt(current); return; }
+    if (current.sha !== base.sha) { showConflict(current); return; }
+  }
+  if (!response.ok) throw new Error('Speichern fehlgeschlagen (HTTP '+response.status+'). Dein Entwurf bleibt erhalten.');
+  const result = await response.json();
+  adopt({sha:result.content.sha,text:draft});
+});
+el('useRemote').onclick = () => {
+  if (remote && confirm('Lokalen Entwurf durch die GitHub-Fassung ersetzen?')) adopt(remote);
+};
+el('merged').onclick = () => {
+  if (remote) { base = remote; showConflict(null); localStatus(); }
+};
+el('showTree').onclick = () => show(false);
+el('showEditor').onclick = () => show(true);
+editor.oninput = localStatus;
+el('download').onclick = () => {
+  const url = URL.createObjectURL(new Blob([editor.value],{type:'text/markdown;charset=utf-8'}));
+  const link = document.createElement('a');
+  link.href = url; link.download = 'projekte.md'; link.click();
+  setTimeout(()=>URL.revokeObjectURL(url),1000);
+};
+render(); localStatus();
+if ('serviceWorker' in navigator) navigator.serviceWorker.register('./sw.js').catch(()=>{});
+</script>
+</html>
